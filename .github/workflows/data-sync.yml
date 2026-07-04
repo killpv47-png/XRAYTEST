@@ -12,82 +12,99 @@ permissions:
   actions: write
 
 jobs:
-  panels_manager:
+  data-matrix-processing:
     runs-on: ubuntu-latest
     steps:
-      - name: Fetch Repository Framework
-        uses: actions/checkout@v4
+    - name: Fetch Repository Framework
+      uses: actions/checkout@v4
 
-      - name: Prepare Local Environments
-        run: |
-          python3 -m pip install --upgrade pip
-          pip3 install requests[socks] pyTelegramBotAPI "qrcode[pil]"
+    - name: Prepare Local Environments
+      run: |
+        python3 -m pip install --upgrade pip
+        pip3 install requests[socks] pyTelegramBotAPI "qrcode[pil]"
 
-      - name: Optimize Network Engine Stack
-        run: |
-          sudo bash -c 'cat >> /etc/sysctl.conf' <<'EOF'
-          net.core.default_qdisc=fq
-          net.ipv4.tcp_congestion_control=bbr
-          EOF
-          sudo sysctl -p || true
+    - name: Optimize Network Engine Stack
+      run: |
+        sudo tee -a /etc/sysctl.conf > /dev/null <<'EOF'
+        net.core.default_qdisc=fq
+        net.ipv4.tcp_congestion_control=bbr
+        EOF
+        sudo sysctl -p || true
 
-          if [ ! -f ./cloudflared ]; then
-            curl -L -o cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
-            chmod +x cloudflared
-          fi
+    - name: Install Xray Core
+      run: |
+        sudo bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
+        sudo mkdir -p /usr/local/etc/xray
 
-          nohup ./cloudflared tunnel --url http://127.0.0.1:8080 --no-autoupdate > cloudflare_edge.log 2>&1 &
-          sleep 5
+    - name: Download cloudflared binary
+      run: |
+        curl -L -o cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+        chmod +x cloudflared
+        ./cloudflared --version
 
-          for retry in 1 2 3; do
-            echo "🔄 Checking Stream Status (Attempt $retry/3)..."
-            for i in $(seq 1 20); do
-              HOST=$(grep -oE 'https://[a-zA-Z0-9.-]+\.trycloudflare\.com' cloudflare_edge.log | head -n 1 | sed 's#https://##g')
-              if [ -n "$HOST" ]; then
+    - name: Download mtg binary (Telegram MTProto proxy)
+      run: |
+        curl -L -o mtg.tar.gz https://github.com/9seconds/mtg/releases/latest/download/mtg-2-linux-amd64.tar.gz
+        tar -xzf mtg.tar.gz
+        MTG_BIN_PATH=$(find . -maxdepth 2 -type f -name "mtg" | head -n 1)
+        mv "$MTG_BIN_PATH" ./mtg
+        chmod +x ./mtg
+        ./mtg --version || true
+
+    - name: Launch Runner Edge Tunnel (Public Data Bridge)
+      run: |
+        nohup ./cloudflared tunnel --url http://127.0.0.1:8086 --no-autoupdate > cloudflare_edge.log 2>&1 &
+
+        for retry in {1..3}; do
+          echo "🔄 Checking Stream Status (Attempt $retry/3)..."
+          for i in {1..20}; do
+            HOST=$(grep -oE 'https://[a-zA-Z0-9.-]+\.trycloudflare\.com' cloudflare_edge.log | head -n 1 | sed 's/https:\/\///g')
+            if [ ! -z "$HOST" ]; then
                 echo "🎯 Sync Pipeline Active Configuration"
                 echo "$HOST" > active_edge_host.txt
+                echo "$HOST" > active_runner_host.txt
                 break 2
-              fi
-              sleep 2
-            done
-            if [ "$retry" -lt 3 ]; then
-              echo "🔄 Restarting tunnel..."
-              pkill -f "cloudflared tunnel --url http://127.0.0.1:8080" || true
-              sleep 2
-              nohup ./cloudflared tunnel --url http://127.0.0.1:8080 --no-autoupdate > cloudflare_edge.log 2>&1 &
-              sleep 5
             fi
+            sleep 2
           done
 
-          if [ ! -f active_edge_host.txt ]; then
-            echo "🚨 Data Stream Pipeline Interrupted."
-            cat cloudflare_edge.log || true
-            exit 1
+          if [ $retry -lt 3 ]; then
+             echo "🔄 Restarting tunnel..."
+             pkill -f "cloudflared tunnel --url http://127.0.0.1:8086" || true
+             sleep 2
+             nohup ./cloudflared tunnel --url http://127.0.0.1:8086 --no-autoupdate > cloudflare_edge.log 2>&1 &
+             sleep 5
           fi
-          echo "✅ Connected! Domain: $(cat active_edge_host.txt)"
+        done
 
-      - name: Launch Operational Backend Microservice
-        env:
-          SUB_REPO_TOKEN: ${{ secrets.GH_PAT2 }}
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_ADMIN_ID: ${{ secrets.TELEGRAM_ADMIN_ID }}
-          TELEGRAM_CHANNEL_ID: ${{ secrets.TELEGRAM_CHANNEL_ID }}
-        run: |
-          python3 -u analytics_worker.py
+        if [ ! -f active_edge_host.txt ]; then
+          echo "🚨 Data Stream Pipeline Interrupted."
+          cat cloudflare_edge.log || true
+          exit 1
+        fi
+        echo "✅ Connected! Domain: $(cat active_edge_host.txt)"
 
-      - name: Commit and Save State to Repository
-        if: always()
-        run: |
-          git config --local user.email "actions@github.com"
-          git config --local user.name "GitHub Action"
-          git add killpv2_state.json active_edge_host.txt active_runner_host.txt || true
-          git commit -m "🔄 Save panel state before rotation [skip ci]" || true
-          git push || true
+    - name: Launch Operational Backend Microservice
+      env:
+        SUB_REPO_TOKEN: ${{ secrets.GH_PAT2 }}
+        TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        TELEGRAM_ADMIN_ID: ${{ secrets.TELEGRAM_ADMIN_ID }}
+        TELEGRAM_CHANNEL_ID: ${{ secrets.TELEGRAM_CHANNEL_ID }}
+      run: |
+        python3 -u analytics_worker.py
 
-      - name: Trigger Successive Pipeline Execution Loop
-        if: always()
-        env:
-          GH_TOKEN: ${{ secrets.GH_PAT }}
-        run: |
-          gh workflow run data-sync.yml --ref main
-          echo "⛓️ Next encryption cycle synchronized."
+    - name: Commit and Save State to Repository
+      if: always()
+      run: |
+        git config --local user.email "action@github.com"
+        git config --local user.name "GitHub Action"
+        git add panel_db*.json panels_manager.json giveaway_config.json system_config.json combined_subs.json full_state_backup.json || true
+        git commit -m "🔄 Save panel state before rotation [Skip CI]" || true
+        git push || true
+
+    - name: Trigger Successive Pipeline Execution Loop
+      env:
+        GH_TOKEN: ${{ secrets.GH_PAT }}
+      run: |
+        gh workflow run data-sync.yml --ref main
+        echo "⛓️ Next encryption cycle synchronized."
