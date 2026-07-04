@@ -1,0 +1,27 @@
+name: KillPV2 Watchdog
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+permissions:
+  actions: write
+
+jobs:
+  check_and_revive:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check main pipeline status
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          REPO="${{ github.repository }}"
+          ACTIVE=$(gh run list --repo "$REPO" --workflow=data-sync.yml --status=in_progress --json databaseId --jq 'length')
+          QUEUED=$(gh run list --repo "$REPO" --workflow=data-sync.yml --status=queued --json databaseId --jq 'length')
+          if [ "$ACTIVE" = "0" ] && [ "$QUEUED" = "0" ]; then
+            echo "⚠️ پایپ‌لاین اصلی خاموشه، دوباره روشنش می‌کنم..."
+            gh workflow run data-sync.yml --repo "$REPO" --ref main
+          else
+            echo "✅ پایپ‌لاین در حال اجراست."
+          fi
